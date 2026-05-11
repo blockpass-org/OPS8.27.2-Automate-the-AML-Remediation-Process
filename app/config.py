@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_config(key, default=None):
-    # 1. Try Secret Manager
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
     if project_id:
         client = secretmanager.SecretManagerServiceClient()
@@ -15,12 +14,16 @@ def get_config(key, default=None):
             return response.payload.data.decode("UTF-8")
         except Exception:
             pass
-            
-    # 2. Try Environment Variable
     return os.getenv(key, default)
 
+# Primary Service
 BLOCKPASS_API_KEY = get_config("BLOCKPASS_API_KEY")
 BLOCKPASS_CLIENT_ID = get_config("BLOCKPASS_CLIENT_ID")
+
+# Supplemental Service
+SUPP_API_KEY = get_config("BLOCKPASS_SUPPLEMENTAL_API_KEY")
+SUPP_CLIENT_ID = get_config("BLOCKPASS_SUPPLEMENTAL_CLIENT_ID")
+
 SHEET_ID = get_config("SHEET_ID")
 GMAIL_USER = get_config("GMAIL_USER")
 STAKEHOLDER_EMAIL = get_config("STAKEHOLDER_EMAIL")
