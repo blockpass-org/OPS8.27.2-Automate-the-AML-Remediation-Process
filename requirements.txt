@@ -1,0 +1,9 @@
+google-cloud-secret-manager
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+requests
+flask
+gunicorn
+pandas
+python-dotenv
