@@ -57,22 +57,55 @@ def flatten_identities(identities, prefix=""):
     return flat
 
 def extract_aml_data(certs, prefix=""):
-    aml_cert = certs.get("aml_risk", {})
-    status = aml_cert.get("status", "CLEAR")
-    hits = aml_cert.get("hits", [])
+    import json
+    # Blockpass AML data is stored in 'member_check_cert' as a JSON string
+    member_check_raw = certs.get("member_check_cert")
     
+    status = "CLEAR"
+    hits = []
+    
+    if member_check_raw:
+        try:
+            member_check = json.loads(member_check_raw)
+            claim = member_check.get("Claim", {})
+            custom_fields = claim.get("_customFields", {})
+            report = custom_fields.get("report", {})
+            
+            matched_number = report.get("matchedNumber", 0)
+            if matched_number > 0:
+                status = "HIT"
+                # Map Blockpass 'matchedEntities' to a consistent hit structure for analysis
+                entities = report.get("matchedEntities", [])
+                for entity in entities:
+                    hits.append({
+                        "name": f"{entity.get('firstName', '')} {entity.get('middleName', '')} {entity.get('lastName', '')}".replace("  ", " ").strip(),
+                        "score": entity.get("matchRate", 100),
+                        "dob": entity.get("dob", ""),
+                        "category": entity.get("category", "N/A"),
+                        "source": entity.get("primaryLocation", "N/A"),
+                        "match_type": entity.get("matchedFields", "N/A")
+                    })
+            else:
+                # reviewBody often contains "Name not found in Sanctions and PEP list"
+                if "not found" in claim.get("reviewBody", "").lower():
+                    status = "CLEAR"
+                else:
+                    status = "REVIEW_REQUIRED"
+                    
+        except Exception as e:
+            print(f"DEBUG: Error parsing member_check_cert: {e}")
+            status = "ERROR"
+
     hit_summaries = []
-    hit_urls = []
     for hit in hits:
-        summary = f"[{hit.get('matchType')}] {hit.get('name')} ({hit.get('source')})"
+        summary = f"[{hit.get('category')}] {hit.get('name')} (Score: {hit.get('score')}%)"
         hit_summaries.append(summary)
-        if hit.get("url"): hit_urls.append(hit.get("url"))
         
     return {
         f"{prefix}aml_status": status,
-        f"{prefix}aml_hits_raw": str(hits),
+        f"{prefix}aml_hits_raw": json.dumps(hits),
         f"{prefix}aml_hits_summary": "; ".join(hit_summaries),
-        f"{prefix}aml_hit_urls": "; ".join(hit_urls)
+        f"{prefix}aml_hit_urls": "" # URLs are not directly provided in this cert structure
     }
 
 def get_all_applicants_full():
