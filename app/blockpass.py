@@ -5,7 +5,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.config import BLOCKPASS_API_KEY, BLOCKPASS_CLIENT_ID, SUPP_API_KEY, SUPP_CLIENT_ID
 
 def get_candidates(api_key, client_id):
-    """Fetches candidates using pagination for a specific service."""
     all_records = []
     limit = 100
     skip = 0
@@ -15,8 +14,7 @@ def get_candidates(api_key, client_id):
         try:
             response = requests.get(url, headers=headers)
             if response.status_code == 429:
-                wait = int(response.json().get("extra", {}).get("retryAfter", 30))
-                time.sleep(wait)
+                time.sleep(30)
                 continue
             response.raise_for_status()
             res_data = response.json()
@@ -24,15 +22,14 @@ def get_candidates(api_key, client_id):
             if not records: break
             all_records.extend(records)
             skip += limit
-            if skip >= 20000: break
-            time.sleep(0.5)
+            if skip >= 2000: break
+            time.sleep(1)
         except Exception as e:
             print(f"DEBUG: Error in pagination for {client_id}: {e}")
             break
     return all_records
 
 def get_record_by_refid(api_key, client_id, ref_id):
-    """Fetches record data using refId lookup."""
     url = f"https://kyc.blockpass.org/kyc/1.0/connect/{client_id}/applicant/{ref_id}"
     headers = {"Authorization": api_key}
     try:
@@ -43,102 +40,114 @@ def get_record_by_refid(api_key, client_id, ref_id):
         if response.status_code == 404: return None
         response.raise_for_status()
         return response.json()
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG: RefID lookup failed for {ref_id}: {e}")
         return None
 
-def get_candidate_data(api_key, client_id, record_id):
-    url = f"https://kyc.blockpass.org/kyc/1.0/connect/{client_id}/recordId/{record_id}"
-    headers = {"Authorization": api_key}
-    for i in range(3):
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code == 429:
-                wait = int(response.json().get("extra", {}).get("retryAfter", 10))
-                time.sleep(wait + 1)
-                continue
-            response.raise_for_status()
-            return response.json()
-        except Exception:
-            time.sleep(1)
-    return None
-
-def flatten_identities(identities):
+def flatten_identities(identities, prefix=""):
     flat = {}
     for key, obj in identities.items():
         if isinstance(obj, dict) and "value" in obj:
             val = obj["value"]
             if isinstance(val, dict):
                 for subkey, subval in val.items():
-                    flat[f"{key}_{subkey}"] = subval
+                    flat[f"{prefix}{key}_{subkey}"] = subval
             else:
-                flat[key] = val
+                flat[f"{prefix}{key}"] = val
     return flat
 
-def extract_aml_data(certs):
+def extract_aml_data(certs, prefix=""):
     aml_cert = certs.get("aml_risk", {})
-    status = aml_cert.get("status", "N/A")
+    status = aml_cert.get("status", "CLEAR")
     hits = aml_cert.get("hits", [])
+    
     hit_summaries = []
     hit_urls = []
     for hit in hits:
-        summary = f"[{hit.get('matchType')}] {hit.get('name')} (Source: {hit.get('source')})"
+        summary = f"[{hit.get('matchType')}] {hit.get('name')} ({hit.get('source')})"
         hit_summaries.append(summary)
         if hit.get("url"): hit_urls.append(hit.get("url"))
+        
     return {
-        "aml_status": status,
-        "aml_hits_raw": str(hits),
-        "aml_hits_summary": "; ".join(hit_summaries),
-        "aml_hit_urls": "; ".join(hit_urls)
+        f"{prefix}aml_status": status,
+        f"{prefix}aml_hits_raw": str(hits),
+        f"{prefix}aml_hits_summary": "; ".join(hit_summaries),
+        f"{prefix}aml_hit_urls": "; ".join(hit_urls)
     }
 
-def process_record(api_key, client_id, record_id, existing_data=None):
-    raw_res = get_candidate_data(api_key, client_id, record_id)
-    if not raw_res: return existing_data
-    
-    data = raw_res.get("data", {})
-    identities = data.get("identities", {})
-    certs = data.get("certificates", {})
-    
-    flat_ids = flatten_identities(identities)
-    aml_data = extract_aml_data(certs)
-    
-    merged = existing_data.copy() if existing_data else {}
-    # Prioritize non-empty values
-    for k, v in {**flat_ids, **aml_data}.items():
-        if v and v != "N/A" and v != "Unknown":
-            merged[k] = v
-            
-    merged.update({
-        "recordId": record_id,
-        "status": data.get("status", merged.get("status")),
-        "isArchived": data.get("isArchived", merged.get("isArchived")),
-        "aml_hits_raw": str(merged.get("aml_hits_raw", "[]"))
-    })
-    return merged
-
 def get_all_applicants_full():
-    """Main extraction: Primary + Supplemental merge."""
-    primary_records = get_candidates(BLOCKPASS_API_KEY, BLOCKPASS_CLIENT_ID)
-    print(f"DEBUG: Found {len(primary_records)} records in primary service.")
+    print(f"DEBUG: Starting extraction. Primary: {BLOCKPASS_CLIENT_ID}, Supp: {SUPP_CLIENT_ID}")
     
+    # 1. Fetch candidate summaries from both services independently
+    primary_summaries = get_candidates(BLOCKPASS_API_KEY, BLOCKPASS_CLIENT_ID)
+    supp_summaries = get_candidates(SUPP_API_KEY, SUPP_CLIENT_ID)
+    
+    print(f"DEBUG: Found {len(primary_summaries)} primary and {len(supp_summaries)} supplemental summaries.")
+    
+    # 2. Map unique refIds to available source info (Primary/Supplemental)
+    entity_map = {} # refId -> { "p_summary": ..., "s_summary": ... }
+    
+    for s in primary_summaries:
+        rid = s.get("refId")
+        if rid:
+            entity_map.setdefault(rid, {})["p_summary"] = s
+            
+    for s in supp_summaries:
+        rid = s.get("refId")
+        if rid:
+            entity_map.setdefault(rid, {})["s_summary"] = s
+
     applicants = []
-    def worker(c):
-        ref_id = c.get("refId")
-        # 1. Process Primary
-        p_data = process_record(BLOCKPASS_API_KEY, BLOCKPASS_CLIENT_ID, c.get("recordId"))
-        # 2. Supplement from new service using refId
-        if ref_id and SUPP_API_KEY and SUPP_CLIENT_ID:
-            supp_res = get_record_by_refid(SUPP_API_KEY, SUPP_CLIENT_ID, ref_id)
-            if supp_res:
-                supp_record_id = supp_res.get("data", {}).get("recordId")
-                if supp_record_id:
-                    p_data = process_record(SUPP_API_KEY, SUPP_CLIENT_ID, supp_record_id, existing_data=p_data)
+
+    def worker(ref_id, sources):
+        p_summary = sources.get("p_summary")
+        s_summary = sources.get("s_summary")
         
-        p_data["refId"] = ref_id
-        return p_data
+        record = {"refId": ref_id}
+        
+        # 3. Pull Full Primary Data if available
+        if p_summary:
+            p_record_id = p_summary.get("recordId")
+            url = f"https://kyc.blockpass.org/kyc/1.0/connect/{BLOCKPASS_CLIENT_ID}/recordId/{p_record_id}"
+            try:
+                p_res = requests.get(url, headers={"Authorization": BLOCKPASS_API_KEY}).json()
+                p_data = p_res.get("data", {})
+                record.update({
+                    "recordId": p_record_id,
+                    "primary_status": p_data.get("status"),
+                    **flatten_identities(p_data.get("identities", {}), "p_"),
+                    **extract_aml_data(p_data.get("certificates", {}), "p_")
+                })
+            except Exception as e:
+                print(f"DEBUG: Failed to fetch primary full data for {ref_id}: {e}")
+
+        # 4. Pull Full Supplemental Data if available
+        if s_summary:
+            s_record_id = s_summary.get("recordId")
+            url = f"https://kyc.blockpass.org/kyc/1.0/connect/{SUPP_CLIENT_ID}/recordId/{s_record_id}"
+            try:
+                s_res = requests.get(url, headers={"Authorization": SUPP_API_KEY}).json()
+                s_data = s_res.get("data", {})
+                record.update({
+                    "supp_status": s_data.get("status"),
+                    **flatten_identities(s_data.get("identities", {}), "s_"),
+                    **extract_aml_data(s_data.get("certificates", {}), "s_")
+                })
+                # Prioritize supplemental for compliance logic compatibility
+                record["aml_hits_raw"] = record.get("s_aml_hits_raw", record.get("p_aml_hits_raw"))
+                record["aml_status"] = record.get("s_aml_status", record.get("p_aml_status"))
+            except Exception as e:
+                print(f"DEBUG: Failed to fetch supplemental full data for {ref_id}: {e}")
+        
+        # 5. Final Fallbacks for consistent analysis processing
+        if "aml_status" not in record:
+            record["aml_status"] = record.get("p_aml_status", "CLEAR")
+            record["aml_hits_raw"] = record.get("p_aml_hits_raw", "[]")
+            
+        return record
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(worker, c) for c in primary_records]
+        futures = [executor.submit(worker, rid, sources) for rid, sources in entity_map.items()]
         for future in as_completed(futures):
             res = future.result()
             if res: applicants.append(res)
@@ -146,5 +155,4 @@ def get_all_applicants_full():
     return applicants
 
 def extract_us_investors():
-    # Kept for compatibility with main.py trigger
     return get_all_applicants_full()
