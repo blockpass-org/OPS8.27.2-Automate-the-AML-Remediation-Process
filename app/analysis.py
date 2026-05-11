@@ -13,16 +13,16 @@ def analyze_record(investor_data):
     """
     Evaluates KYC records based on the AML_Discount_Workflow.md policy.
     """
+    import json
     # 1. Hit Quality Logic (Step 2 in Policy)
-    aml_hits = investor_data.get("aml_hits_raw", "[]")
-    if isinstance(aml_hits, str):
-        try:
-            import ast
-            aml_hits = eval(aml_hits) # Safe enough for our controlled string
-        except:
-            aml_hits = []
+    aml_hits_raw = investor_data.get("aml_hits_raw", "[]")
+    try:
+        aml_hits = json.loads(aml_hits_raw)
+    except:
+        aml_hits = []
 
-    if not aml_hits or investor_data.get("aml_status") == "CLEAR":
+    aml_status = investor_data.get("aml_status", "CLEAR")
+    if not aml_hits or aml_status == "CLEAR":
         return "False Positive", "No AML hits found. Status is CLEAR."
 
     name = investor_data.get("name", investor_data.get("given_name", "N/A"))
